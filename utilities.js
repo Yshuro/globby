@@ -534,7 +534,7 @@ const getRulePrune = ({pattern, directory}, {cwd, matcher, hasNegations, canSkip
 	if (!body.includes('/') && canSkipAtAnyDepth(body)) {
 		const relativeDirectory = slash(path.relative(cwd, directory));
 		const prefix = isInsideCwd(relativeDirectory) ? `${fastGlob.escapePath(relativeDirectory)}/` : '';
-		return {pattern: toFastGlob(`${prefix}**/${isGlob ? body : toLiteralPattern(body)}`), guardName: body};
+		return {pattern: toFastGlob(`${prefix}**/${isGlob ? body : toLiteralPattern(body)}`), guardName: body, isDirectoryPattern};
 	}
 
 	// Otherwise fall back to the single occurrence beside the ignore file, which names a concrete path that the matcher can verify directly.
@@ -551,7 +551,7 @@ const getRulePrune = ({pattern, directory}, {cwd, matcher, hasNegations, canSkip
 		// A glob does not name a concrete path, so the matcher cannot confirm it is ignored.
 		return hasNegations
 			? undefined
-			: {pattern: toFastGlob(target), guardName};
+			: {pattern: toFastGlob(target), guardName, isDirectoryPattern};
 	}
 
 	if (!matcher(path.resolve(cwd, target) + path.sep).ignored) {
@@ -563,6 +563,7 @@ const getRulePrune = ({pattern, directory}, {cwd, matcher, hasNegations, canSkip
 	return {
 		pattern: toFastGlob(fastGlob.escapePath(target)),
 		guardName: needsGuard ? guardName : undefined,
+		isDirectoryPattern,
 	};
 };
 
@@ -590,11 +591,11 @@ negations that could name one of them; see `negationsCouldRescue`.
 @param {Object} [options] - Options.
 @param {boolean} [options.gitignoreOnlySearch] - Whether the rule set can only grow through nested `.gitignore` files.
 @param {boolean} [options.searchesForGitignoreFiles] - Whether the search includes `.gitignore` files.
-@returns {{patterns: string[], guardNames: string[]}} Patterns safe to pass to fast-glob, and the names their safety depends on.
+@returns {{patterns: string[], guardNames: string[], directoryPatterns: string[]}} Patterns safe to pass to fast-glob, and the names their safety depends on.
 */
 export const buildPrunePatternsAndGuards = (rules, matcher, cwd, {gitignoreOnlySearch = false, searchesForGitignoreFiles = false} = {}) => {
 	if (!matcher || !cwd || !rules || rules.length === 0) {
-		return {patterns: [], guardNames: []};
+		return {patterns: [], guardNames: [], directoryPatterns: []};
 	}
 
 	const negationNames = getNegationFinalSegments(rules);
@@ -610,6 +611,7 @@ export const buildPrunePatternsAndGuards = (rules, matcher, cwd, {gitignoreOnlyS
 
 	const patterns = [];
 	const guardNames = [];
+	const directoryPatterns = [];
 
 	for (const rule of rules) {
 		const prune = getRulePrune(rule, context);
@@ -621,9 +623,13 @@ export const buildPrunePatternsAndGuards = (rules, matcher, cwd, {gitignoreOnlyS
 		if (prune.guardName !== undefined) {
 			guardNames.push(prune.guardName);
 		}
+
+		if (prune.isDirectoryPattern) {
+			directoryPatterns.push(prune.pattern);
+		}
 	}
 
-	return {patterns, guardNames};
+	return {patterns, guardNames, directoryPatterns};
 };
 
 export const convertPatternsForFastGlob = (rules, matcher, cwd) => buildPrunePatternsAndGuards(rules, matcher, cwd).patterns;

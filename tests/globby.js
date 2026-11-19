@@ -1151,6 +1151,45 @@ test.serial('gitignore directory patterns stop fast-glob traversal', async t => 
 	}
 });
 
+test('gitignore directory-only patterns do not drop regular files matching rule name (issue #282)', async t => {
+	const temporaryCwd = temporaryDirectory();
+	const gitignorePath = path.join(temporaryCwd, '.gitignore');
+	const fileMatchingDirectoryRule = path.join(temporaryCwd, 'build');
+	const fileInsideIgnoredDirectory = path.join(temporaryCwd, 'src/build/out.js');
+	const regularFile = path.join(temporaryCwd, 'keep.js');
+
+	fs.writeFileSync(gitignorePath, 'build/\n', 'utf8');
+	fs.writeFileSync(fileMatchingDirectoryRule, '', 'utf8');
+	fs.mkdirSync(path.dirname(fileInsideIgnoredDirectory), {recursive: true});
+	fs.writeFileSync(fileInsideIgnoredDirectory, '', 'utf8');
+	fs.writeFileSync(regularFile, '', 'utf8');
+
+	try {
+		const result = await globby('**', {
+			cwd: temporaryCwd,
+			gitignore: true,
+			dot: true,
+		});
+		t.deepEqual(result.sort(), ['.gitignore', 'build', 'keep.js']);
+
+		const syncResult = globbySync('**', {
+			cwd: temporaryCwd,
+			gitignore: true,
+			dot: true,
+		});
+		t.deepEqual(syncResult.sort(), ['.gitignore', 'build', 'keep.js']);
+
+		const streamResult = [];
+		for await (const entry of globbyStream('**', {cwd: temporaryCwd, gitignore: true, dot: true})) {
+			streamResult.push(entry);
+		}
+
+		t.deepEqual(streamResult.sort(), ['.gitignore', 'build', 'keep.js']);
+	} finally {
+		fs.rmSync(temporaryCwd, {recursive: true, force: true});
+	}
+});
+
 test('respects ignoreFiles string option', async t => {
 	const actual = await runGlobby(t, '*', {gitignore: false, ignoreFiles: '.gitignore', onlyFiles: false});
 	t.false(actual.includes('node_modules'));

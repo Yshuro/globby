@@ -4,6 +4,8 @@ import nodePath from 'node:path';
 import {Readable} from 'node:stream';
 import mergeStreams from '@sindresorhus/merge-streams';
 import fastGlob from 'fast-glob';
+import micromatch from 'micromatch';
+import slash from 'slash';
 import {toPath} from 'unicorn-magic/node';
 import {
 	GITIGNORE_FILES_PATTERN,
@@ -20,7 +22,7 @@ import {
 	getStaticAbsolutePathPrefix,
 	normalizeNegativePattern,
 	adjustIgnorePatternsForParentDirectories,
-	convertPatternsForFastGlob,
+	buildPrunePatternsAndGuards,
 	convertIgnorePatternsForIgnoreFileSearch,
 	findGitRoot,
 	findGitRootSync,
@@ -237,11 +239,12 @@ const buildIgnoreFilterResult = ({options, cwd, ignoreResult: {rules, matcher}, 
 	const finalPredicate = combinePredicate(matcher, globalMatcher);
 
 	// Patterns fast-glob can use to skip ignored directories while traversing. The predicate below stays authoritative, so this only ever needs to be safe, never exhaustive. They are returned separately from `options.ignore` so they skip directory expansion and the parent-directory adjustment, which would rebase them outside the scope their ignore files govern.
-	const pruneIgnorePatterns = convertPatternsForFastGlob(rules, matcher, cwd);
+	const {patterns: pruneIgnorePatterns, directoryPatterns: directoryPrunePatterns} = buildPrunePatternsAndGuards(rules, matcher, cwd);
 
 	return {
 		options,
 		pruneIgnorePatterns,
+		directoryPrunePatterns,
 		filter: createFilter(finalPredicate, cwd, options.fs),
 	};
 };
@@ -260,7 +263,7 @@ to fast-glob's results. Rules that provably cannot be affected by negations are 
 translated into fast-glob `ignore` patterns, so whole ignored directories are skipped during
 traversal; see `convertPatternsForFastGlob`.
 
-@returns {Promise<{options: Object, pruneIgnorePatterns: string[], filter: Function}>}
+@returns {Promise<{options: Object, pruneIgnorePatterns: string[], directoryPrunePatterns: string[], filter: Function}>}
 */
 const applyIgnoreFilesAndGetFilter = async options => {
 	const cwd = options.cwd ?? process.cwd();
@@ -271,6 +274,7 @@ const applyIgnoreFilesAndGetFilter = async options => {
 		return {
 			options,
 			pruneIgnorePatterns: [],
+			directoryPrunePatterns: [],
 			filter: createFilterFunctionAsync(false, cwd, options.fs),
 		};
 	}
@@ -297,7 +301,7 @@ const applyIgnoreFilesAndGetFilter = async options => {
 /**
 Apply ignore files to options and return the filter predicate (sync version).
 
-@returns {{options: Object, pruneIgnorePatterns: string[], filter: Function}}
+@returns {{options: Object, pruneIgnorePatterns: string[], directoryPrunePatterns: string[], filter: Function}}
 */
 const applyIgnoreFilesAndGetFilterSync = options => {
 	const cwd = options.cwd ?? process.cwd();
@@ -308,6 +312,7 @@ const applyIgnoreFilesAndGetFilterSync = options => {
 		return {
 			options,
 			pruneIgnorePatterns: [],
+			directoryPrunePatterns: [],
 			filter: createFilterFunction(false, cwd, options.fs),
 		};
 	}
@@ -463,7 +468,24 @@ const createFilterFunction = (isIgnored, cwd, fsImplementation) => {
 	};
 };
 
-const unionFastGlobResults = (results, filter) => results.flat().filter(fastGlobResult => filter(fastGlobResult));
+const unionFastGlobResults = (results, filter) => {
+	results = results.flat();
+	const seen = new Set();
+	return results.filter(fastGlobResult => {
+		if (!filter(fastGlobResult)) {
+			return false;
+		}
+
+		const pathKey = nodePath.normalize(fastGlobResult.path ?? fastGlobResult);
+		if (seen.has(pathKey)) {
+			return false;
+		}
+
+		seen.add(pathKey);
+		return true;
+	});
+};
+
 const unionFastGlobResultsAsync = async (results, filter) => {
 	results = results.flat();
 	const matches = await Promise.all(results.map(fastGlobResult => filter(fastGlobResult)));
@@ -641,16 +663,186 @@ const generateTasksSync = (patterns, options, pruneIgnorePatterns = []) => {
 	return appendPruneIgnorePatterns(tasks, pruneIgnorePatterns);
 };
 
+const isDirectoryEntry = (entry, fullPath, baseFs) => {
+	if (entry.isDirectory()) {
+		return true;
+	}
+
+	if (entry.isSymbolicLink()) {
+		try {
+			return (baseFs.statSync ?? fs.statSync)(fullPath).isDirectory();
+		} catch {
+			return false;
+		}
+	}
+
+	return false;
+};
+
+const isCandidateMatchingTask = (relativePath, task, userIgnore) => {
+	if (task.options.onlyDirectories) {
+		return false;
+	}
+
+	const micromatchOptions = {dot: Boolean(task.options.dot)};
+	if (!micromatch.isMatch(relativePath, task.patterns, micromatchOptions)) {
+		return false;
+	}
+
+	return userIgnore.length === 0 || !micromatch.isMatch(relativePath, userIgnore, micromatchOptions);
+};
+
+const formatCandidateResult = ({entry, relativePath, fullPath, stats}, options) => {
+	const formattedPath = options.absolute ? slash(fullPath) : relativePath;
+	if (options.objectMode || options.stats) {
+		return {
+			name: entry.name,
+			path: formattedPath,
+			dirent: entry,
+			...(options.stats ? {stats} : {}),
+		};
+	}
+
+	return formattedPath;
+};
+
+const salvageFromEntries = (entries, dirPath, context, onSalvage) => {
+	if (!Array.isArray(entries)) {
+		return;
+	}
+
+	const {cwd, directoryPrunePatterns, tasks, baseFs} = context;
+	const micromatchOptions = {dot: true};
+	const stringDirPath = typeof dirPath === 'string' ? dirPath : dirPath.toString();
+
+	for (const entry of entries) {
+		const fullPath = nodePath.join(stringDirPath, entry.name);
+		if (isDirectoryEntry(entry, fullPath, baseFs)) {
+			continue;
+		}
+
+		const relativePath = slash(nodePath.relative(cwd, fullPath));
+		if (!micromatch.isMatch(relativePath, directoryPrunePatterns, micromatchOptions)) {
+			continue;
+		}
+
+		for (const task of tasks) {
+			const userIgnore = (task.options.ignore ?? []).filter(pattern => !directoryPrunePatterns.includes(pattern));
+			if (isCandidateMatchingTask(relativePath, task, userIgnore)) {
+				onSalvage({
+					entry, relativePath, fullPath, taskOptions: task.options,
+				});
+				break;
+			}
+		}
+	}
+};
+
+const executeFastGlobSync = (task, directoryPrunePatterns = []) => {
+	if (!directoryPrunePatterns || directoryPrunePatterns.length === 0) {
+		return fastGlob.sync(task.patterns, task.options);
+	}
+
+	const cwd = task.options.cwd ? nodePath.resolve(task.options.cwd) : process.cwd();
+	const baseFs = task.options.fs ?? fs;
+	const context = {
+		cwd, directoryPrunePatterns, tasks: [task], baseFs,
+	};
+	const salvaged = [];
+
+	const wrappedFs = {
+		...baseFs,
+		readdirSync(dirPath, options) {
+			const entries = baseFs.readdirSync(dirPath, options);
+			if (options?.withFileTypes) {
+				salvageFromEntries(entries, dirPath, context, candidate => {
+					let stats;
+					if (task.options.stats) {
+						try {
+							stats = baseFs.statSync(candidate.fullPath);
+						} catch {}
+					}
+
+					candidate.stats = stats;
+					salvaged.push(formatCandidateResult(candidate, task.options));
+				});
+			}
+
+			return entries;
+		},
+	};
+
+	const results = fastGlob.sync(task.patterns, {...task.options, fs: wrappedFs});
+	return salvaged.length === 0 ? results : [...results, ...salvaged];
+};
+
+const executeFastGlobAsync = async (task, directoryPrunePatterns = []) => {
+	if (!directoryPrunePatterns || directoryPrunePatterns.length === 0) {
+		return fastGlob(task.patterns, task.options);
+	}
+
+	const cwd = task.options.cwd ? nodePath.resolve(task.options.cwd) : process.cwd();
+	const baseFs = task.options.fs ?? fs;
+	const context = {
+		cwd, directoryPrunePatterns, tasks: [task], baseFs,
+	};
+	const rawSalvaged = [];
+
+	const wrappedFs = {
+		...baseFs,
+		readdir(dirPath, options, callback) {
+			if (typeof options === 'function') {
+				callback = options;
+				options = undefined;
+			}
+
+			/* eslint-disable-next-line n/prefer-promises/fs */
+			baseFs.readdir(dirPath, options, (error, entries) => {
+				if (!error && options?.withFileTypes) {
+					salvageFromEntries(entries, dirPath, context, candidate => {
+						rawSalvaged.push(candidate);
+					});
+				}
+
+				callback(error, entries);
+			});
+		},
+	};
+
+	const results = await fastGlob(task.patterns, {...task.options, fs: wrappedFs});
+	if (rawSalvaged.length === 0) {
+		return results;
+	}
+
+	const statMethod = baseFs.promises?.stat
+		?? (baseFs.stat ? promisifyFsMethod(baseFs, 'stat') : undefined)
+		?? fs.promises.stat;
+
+	const salvaged = await Promise.all(rawSalvaged.map(async candidate => {
+		let stats;
+		if (task.options.stats) {
+			try {
+				stats = await statMethod(candidate.fullPath);
+			} catch {}
+		}
+
+		candidate.stats = stats;
+		return formatCandidateResult(candidate, task.options);
+	}));
+
+	return [...results, ...salvaged];
+};
+
 export const globby = normalizeArguments(async (patterns, options) => {
 	assertGlobalGitignoreAsyncSupport(options);
 
 	// Apply ignore files and get filter (reads .gitignore files once)
-	const {options: modifiedOptions, pruneIgnorePatterns, filter} = await applyIgnoreFilesAndGetFilter(options);
+	const {options: modifiedOptions, pruneIgnorePatterns, directoryPrunePatterns, filter} = await applyIgnoreFilesAndGetFilter(options);
 
 	// Generate tasks, attaching the prune patterns so fast-glob skips ignored directories
 	const tasks = await generateTasks(patterns, modifiedOptions, pruneIgnorePatterns);
 
-	const results = await Promise.all(tasks.map(task => fastGlob(task.patterns, task.options)));
+	const results = await Promise.all(tasks.map(task => executeFastGlobAsync(task, directoryPrunePatterns)));
 	return unionFastGlobResultsAsync(results, filter);
 });
 
@@ -658,14 +850,31 @@ export const globbySync = normalizeArgumentsSync((patterns, options) => {
 	assertGlobalGitignoreSyncSupport(options);
 
 	// Apply ignore files and get filter (reads .gitignore files once)
-	const {options: modifiedOptions, pruneIgnorePatterns, filter} = applyIgnoreFilesAndGetFilterSync(options);
+	const {options: modifiedOptions, pruneIgnorePatterns, directoryPrunePatterns, filter} = applyIgnoreFilesAndGetFilterSync(options);
 
 	// Generate tasks, attaching the prune patterns so fast-glob skips ignored directories
 	const tasks = generateTasksSync(patterns, modifiedOptions, pruneIgnorePatterns);
 
-	const results = tasks.map(task => fastGlob.sync(task.patterns, task.options));
+	const results = tasks.map(task => executeFastGlobSync(task, directoryPrunePatterns));
 	return unionFastGlobResults(results, filter);
 });
+
+const resolveSalvagedCandidates = async (rawSalvaged, baseFs) => {
+	const statMethod = baseFs.promises?.stat
+		?? (baseFs.stat ? promisifyFsMethod(baseFs, 'stat') : undefined)
+		?? fs.promises.stat;
+
+	return Promise.all(rawSalvaged.map(async candidate => {
+		let stats;
+		if (candidate.taskOptions.stats) {
+			try {
+				stats = await statMethod(candidate.fullPath);
+			} catch {}
+		}
+
+		return formatCandidateResult({...candidate, stats}, candidate.taskOptions);
+	}));
+};
 
 export const globbyStream = normalizeArgumentsSync((patterns, options) => {
 	assertGlobalGitignoreAsyncSupport(options);
@@ -673,7 +882,7 @@ export const globbyStream = normalizeArgumentsSync((patterns, options) => {
 	const seen = new Set();
 	const stream = Readable.from((async function * () {
 		// Apply ignore files and get filter (reads .gitignore files once)
-		const {options: modifiedOptions, pruneIgnorePatterns, filter} = await applyIgnoreFilesAndGetFilter(options);
+		const {options: modifiedOptions, pruneIgnorePatterns, directoryPrunePatterns, filter} = await applyIgnoreFilesAndGetFilter(options);
 
 		// Generate tasks, attaching the prune patterns so fast-glob skips ignored directories
 		const tasks = await generateTasks(patterns, modifiedOptions, pruneIgnorePatterns);
@@ -682,13 +891,57 @@ export const globbyStream = normalizeArgumentsSync((patterns, options) => {
 			return;
 		}
 
-		const streams = tasks.map(task => fastGlob.stream(task.patterns, task.options));
+		const cwd = modifiedOptions.cwd ? nodePath.resolve(modifiedOptions.cwd) : process.cwd();
+		const baseFs = modifiedOptions.fs ?? fs;
+		const context = {
+			cwd, directoryPrunePatterns, tasks, baseFs,
+		};
+		const rawSalvaged = [];
+
+		const wrappedFs = (!directoryPrunePatterns || directoryPrunePatterns.length === 0)
+			? baseFs
+			: {
+				...baseFs,
+				readdir(dirPath, options, callback) {
+					if (typeof options === 'function') {
+						callback = options;
+						options = undefined;
+					}
+
+					/* eslint-disable-next-line n/prefer-promises/fs */
+					baseFs.readdir(dirPath, options, (error, entries) => {
+						if (!error && options?.withFileTypes) {
+							salvageFromEntries(entries, dirPath, context, candidate => {
+								rawSalvaged.push(candidate);
+							});
+						}
+
+						callback(error, entries);
+					});
+				},
+			};
+
+		const streams = tasks.map(task => fastGlob.stream(task.patterns, {...task.options, fs: wrappedFs}));
 
 		for await (const fastGlobResult of mergeStreams(streams)) {
 			const pathKey = nodePath.normalize(fastGlobResult.path ?? fastGlobResult);
 			if (!seen.has(pathKey) && await filter(fastGlobResult)) {
 				seen.add(pathKey);
 				yield fastGlobResult;
+			}
+		}
+
+		if (rawSalvaged.length > 0) {
+			const candidates = await resolveSalvagedCandidates(rawSalvaged, baseFs);
+			const matches = await Promise.all(candidates.map(candidate => filter(candidate)));
+			for (const [index, candidate] of candidates.entries()) {
+				if (matches[index]) {
+					const pathKey = nodePath.normalize(candidate.path ?? candidate);
+					if (!seen.has(pathKey)) {
+						seen.add(pathKey);
+						yield candidate;
+					}
+				}
 			}
 		}
 	})());
